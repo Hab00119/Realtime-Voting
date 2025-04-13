@@ -1,0 +1,283 @@
+version: "3.8"
+
+services:
+  # Data generation services
+  data-generator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.generator
+    volumes:
+      - ./data_generator:/app/data_generator
+    environment:
+      - VOTERS_COUNT=1000
+      - VOTES_PER_MINUTE=100
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    networks:
+      - voting-network
+    depends_on:
+      - kafka
+    command: python -m data_generator.voter_gen2
+
+  vote-simulator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.generator
+    volumes:
+      - ./data_generator:/app/data_generator
+    environment:
+      - VOTES_PER_MINUTE=100
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    networks:
+      - voting-network
+    depends_on:
+      - kafka
+      - data-generator
+    #command: python -m data_generator.vote_sim2
+    command: python -m data_generator.real_vote_simulator
+    #command: python -m data_generator.real_vote_sim2
+
+  # Kafka infrastructure
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms256M"
+    networks:
+      - voting-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,HOST://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CREATE_TOPICS: "votes:4:1,voters:1:1"
+    networks:
+      - voting-network
+    depends_on:
+      - zookeeper
+
+  # DLT pipeline for data ingestion
+  dlt-pipeline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ingestion
+    volumes:
+      - ./ingestion:/app/ingestion
+      - ~/.dlt:/root/.dlt
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - STORAGE_PREFERENCE=GCP  # or GCP
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=voting_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      # Add for GCP if needed
+      - GCP_CREDENTIALS_PATH=/workspaces/Realtime-Voting/dprof-dezoomfinal-b4d188529d18.json
+    networks:
+      - voting-network
+    depends_on:
+      - kafka
+      - postgres
+    #command: python -m ingestion.dlt_pipeline.voter_pipeline2
+    #command: python ingestion/dlt_pipeline/voter_pipeline.py
+    command: python ingestion/dlt_pipeline/real_dlt.py
+
+  # Kestra server for workflow orchestration
+  kestra:
+    image: kestra/kestra:latest
+    pull_policy: always
+    # Note that this setup with a root user is intended for development purpose.
+    user: "root"
+    command: server standalone
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+      - ./ingestion/kestra_workflows:/app/workflows
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: k3str4
+        kestra:
+          server:
+            basicAuth:
+              enabled: false
+              username: "admin@kestra.io" # it must be a valid email address
+              password: kestra
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              basePath: "/app/storage"
+          queue:
+            type: postgres
+          tutorialFlows:
+            enabled: false
+          tasks:
+            tmpDir:
+              path: /tmp/kestra-wd/tmp
+          url: http://localhost:8080/
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    networks:
+      - voting-network
+    depends_on:
+      postgres:
+        condition: service_started
+
+  redpanda-1:
+    image: redpandadata/redpanda:v24.2.18  # Using Redpanda image
+    container_name: redpanda-1  # Container name
+    command:
+      - redpanda
+      - start
+      - --smp
+      - '1'  # Configure number of CPU cores Redpanda will use
+      - --reserve-memory
+      - 0M  # Reserve no memory
+      - --overprovisioned  # Allow overprovisioning of resources (for dev environments)
+      - --node-id
+      - '1'  # Redpanda node id
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092  # Kafka address binding inside and outside container
+      - --advertise-kafka-addr
+      - PLAINTEXT://redpanda-1:29092,OUTSIDE://localhost:9092  # Advertised Kafka address
+      - --pandaproxy-addr
+      - PLAINTEXT://0.0.0.0:28082,OUTSIDE://0.0.0.0:8082  # Pandaproxy address
+      - --advertise-pandaproxy-addr
+      - PLAINTEXT://redpanda-1:28082,OUTSIDE://localhost:8082  # Advertised Pandaproxy address
+      - --rpc-addr
+      - 0.0.0.0:33145  # RPC address binding
+      - --advertise-rpc-addr
+      - redpanda-1:33145  # Advertised RPC address
+    ports:
+      - 8082:8082  # Expose Pandaproxy port inside container
+      - 9092:9092  # Expose Kafka port inside container
+      - 28082:28082  # Expose Pandaproxy port outside container
+      - 29092:29092  # Expose Kafka port outside container
+    networks:
+      - voting-network
+
+  # Flink Job Manager service
+  jobmanager:
+    build:
+      context: .  # Build from the current directory
+      dockerfile: docker/Dockerfile.flink  # Use the custom Dockerfile for Flink
+    image: pyflink:1.16.0  # Image tag for Flink job manager
+    container_name: "flink-jobmanager"  # Container name
+    pull_policy: never  # Don't pull the image if already built locally
+    platform: "linux/amd64"  # Platform architecture
+    hostname: "jobmanager"  # Hostname for the container
+    expose:
+      - "6123"  # Expose Flink job manager RPC port
+    ports:
+      - "8081:8081"  # Expose Flink web UI port
+    volumes:
+      - ./:/opt/flink/usrlib  # Mount current directory as a library directory
+      - ./keys/:/var/private/ssl/  # Mount SSL keys directory
+      - ./src/:/opt/src  # Mount source code directory
+    command: jobmanager  # Run job manager
+    extra_hosts:
+      - "host.docker.internal:127.0.0.1"  # Allow access to host from container (Linux)
+      - "host.docker.internal:host-gateway"  # Enable access to host machine services
+    environment:
+      - POSTGRES_URL=${POSTGRES_URL:-jdbc:postgresql://host.docker.internal:5432/postgres}  # Postgres URL
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}  # Postgres user
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}  # Postgres password
+      - POSTGRES_DB=${POSTGRES_DB:-postgres}  # Postgres database name
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager  # Set Job Manager RPC address
+    networks:
+      - voting-network
+
+  # Flink Task Manager service
+  taskmanager:
+    image: pyflink:1.16.0  # Image tag for Flink task manager
+    container_name: "flink-taskmanager"  # Container name
+    pull_policy: never  # Don't pull the image if already built locally
+    platform: "linux/amd64"  # Platform architecture
+    expose:
+      - "6121"  # Expose task manager port for communication with job manager
+      - "6122"  # Expose task manager port for communication with task manager
+    volumes:
+      - ./:/opt/flink/usrlib  # Mount current directory as a library directory
+      - ./src/:/opt/src  # Mount source code directory
+    depends_on:
+      - jobmanager  # Task manager depends on the job manager being up
+    command: taskmanager --taskmanager.registration.timeout 5 min  # Task manager startup command
+    extra_hosts:
+      - "host.docker.internal:127.0.0.1"  # Access host machine services
+      - "host.docker.internal:host-gateway"  # Access services on host machine
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager  # Job manager address for task manager
+        taskmanager.numberOfTaskSlots: 15  # Set task slots (parallelism)
+        parallelism.default: 3  # Default parallelism for tasks
+    networks:
+      - voting-network
+  
+  
+  
+  
+  # PostgreSQL database
+  postgres:
+    image: postgres:14
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_MULTIPLE_DATABASES: "voting_db,kestra"
+      POSTGRES_KESTRA_USER: kestra
+      POSTGRES_KESTRA_PASSWORD: k3str4
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/postgres-init.sh
+    networks:
+      - voting-network
+
+  # pgweb - PostgreSQL web interface
+  pgweb:
+    image: sosedoff/pgweb
+    ports:
+      - "8085:8081"
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/voting_db?sslmode=disable
+    networks:
+      - voting-network
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+networks:
+  voting-network:
+    driver: bridge
+
+volumes:
+  kestra-data:
+  postgres-data:

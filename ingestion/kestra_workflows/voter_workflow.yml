@@ -1,0 +1,206 @@
+id: voting_system_workflow
+namespace: voting
+
+tasks:
+  - id: generate_voter_data
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json
+      import os
+      import sys
+      import random
+      import uuid
+      import requests
+      from faker import Faker
+      from datetime import datetime, timedelta
+
+      fake = Faker()
+
+      # US States data
+      US_STATES = [
+          "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+          "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
+          "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana",
+          "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+          "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+          "New Hampshire", "New Jersey", "New Mexico", "New York",
+          "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+          "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+          "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+          "West Virginia", "Wisconsin", "Wyoming"
+      ]
+      
+      # Create counties for each state
+      COUNTIES_BY_STATE = {state: [fake.city() for _ in range(5)] for state in US_STATES}
+      
+      # Fetch candidate images from RandomUser API
+      def fetch_candidate_images(count=4):
+          try:
+              response = requests.get(f"https://randomuser.me/api/?results={count}")
+              data = response.json()
+              return [user['picture']['large'] for user in data['results']]
+          except Exception as e:
+              print(f"Error fetching candidate images: {e}")
+              return ["https://randomuser.me/api/portraits/men/1.jpg",
+                     "https://randomuser.me/api/portraits/women/1.jpg",
+                     "https://randomuser.me/api/portraits/men/2.jpg",
+                     "https://randomuser.me/api/portraits/women/2.jpg"]
+      
+      # Get candidate images
+      candidate_images = fetch_candidate_images(4)
+      
+      # Define candidates with images
+      CANDIDATES = [
+          {"name": "Candidate A", "image_url": candidate_images[0]},
+          {"name": "Candidate B", "image_url": candidate_images[1]},
+          {"name": "Candidate C", "image_url": candidate_images[2]},
+          {"name": "Candidate D", "image_url": candidate_images[3]}
+      ]
+      
+      # Generate voters
+      voters = []
+      for i in range(100):
+          state = random.choice(US_STATES)
+          gender = random.choice(["Male", "Female", "Non-binary", "Other"])
+          
+          voter = {
+              "voter_id": str(uuid.uuid4()),
+              "name": fake.name(),
+              "age": random.randint(18, 95),
+              "gender": gender,
+              "state": state,
+              "county": random.choice(COUNTIES_BY_STATE[state]),
+              "registration_date": (datetime.now() - timedelta(days=random.randint(1, 365))).isoformat()
+          }
+          
+          voters.append(voter)
+
+      # Save to outputs for next tasks
+      with open(os.path.join(outputDir, "voters.json"), "w") as f:
+          json.dump(voters, f)
+      
+      # Save candidates to outputs
+      with open(os.path.join(outputDir, "candidates.json"), "w") as f:
+          json.dump(CANDIDATES, f)
+
+      print(f"Generated {len(voters)} new voters and {len(CANDIDATES)} candidates with images")
+
+  - id: generate_votes
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json
+      import os
+      import sys
+      import random
+      import uuid
+      from datetime import datetime
+
+      # Load voters from previous task
+      with open(os.path.join(inputs["generate_voter_data"].files["voters.json"]), "r") as f:
+          voters = json.load(f)
+      
+      # Load candidates from previous task
+      with open(os.path.join(inputs["generate_voter_data"].files["candidates.json"]), "r") as f:
+          candidates = json.load(f)
+      
+      # Define polling stations
+      POLLING_STATIONS = ["Station-" + str(i) for i in range(1, 21)]
+      
+      # Generate votes
+      votes = []
+      for _ in range(200):  # Generate 200 votes
+          voter = random.choice(voters)
+          candidate = random.choice(candidates)
+          
+          vote = {
+              "vote_id": str(uuid.uuid4()),
+              "voter_id": voter["voter_id"],
+              "candidate": candidate["name"],
+              "candidate_image": candidate["image_url"],
+              "timestamp": datetime.now().isoformat(),
+              "polling_station": random.choice(POLLING_STATIONS)
+          }
+          
+          votes.append(vote)
+      
+      # Save to outputs for next tasks
+      with open(os.path.join(outputDir, "votes.json"), "w") as f:
+          json.dump(votes, f)
+      
+      print(f"Generated {len(votes)} votes")
+
+  - id: load_voters_to_gcp
+    type: io.kestra.plugin.gcp.bigquery.LoadFromFile
+    from: "{{ outputs.generate_voter_data.files['voters.json'] }}"
+    destinationTable: voting_system.voters
+    format: JSON
+    createDisposition: CREATE_IF_NEEDED
+    writeDisposition: WRITE_APPEND
+    when:
+      condition: "{{ vars.storage_preference == 'GCP' }}"
+
+  - id: load_votes_to_gcp
+    type: io.kestra.plugin.gcp.bigquery.LoadFromFile
+    from: "{{ outputs.generate_votes.files['votes.json'] }}"
+    destinationTable: voting_system.votes
+    format: JSON
+    createDisposition: CREATE_IF_NEEDED
+    writeDisposition: WRITE_APPEND
+    when:
+      condition: "{{ vars.storage_preference == 'GCP' }}"
+
+  - id: load_voters_to_postgres
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres:5432/voting_db
+    username: voting_user
+    password: voting_password
+    script: |
+      {% for voter in outputs.generate_voter_data.files['voters.json'] | fromJson %}
+      INSERT INTO voters (
+        voter_id, name, age, gender, state, county, registration_date
+      ) VALUES (
+        '{{ voter.voter_id }}',
+        '{{ voter.name }}',
+        {{ voter.age }},
+        '{{ voter.gender }}',
+        '{{ voter.state }}',
+        '{{ voter.county }}',
+        '{{ voter.registration_date }}'
+      ) ON CONFLICT (voter_id) DO NOTHING;
+      {% endfor %}
+    when:
+      condition: "{{ vars.storage_preference == 'POSTGRES' }}"
+
+  - id: load_votes_to_postgres
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: jdbc:postgresql://postgres:5432/voting_db
+    username: voting_user
+    password: voting_password
+    script: |
+      {% for vote in outputs.generate_votes.files['votes.json'] | fromJson %}
+      INSERT INTO votes (
+        vote_id, voter_id, candidate, candidate_image, timestamp, polling_station
+      ) VALUES (
+        '{{ vote.vote_id }}',
+        '{{ vote.voter_id }}',
+        '{{ vote.candidate }}',
+        '{{ vote.candidate_image }}',
+        '{{ vote.timestamp }}',
+        '{{ vote.polling_station }}'
+      ) ON CONFLICT (vote_id) DO NOTHING;
+      {% endfor %}
+    when:
+      condition: "{{ vars.storage_preference == 'POSTGRES' }}"
+
+  - id: trigger_dbt_run
+    type: io.kestra.plugin.scripts.shell.Commands
+    commands:
+      - cd /usr/app && dbt run --models voter_analytics
+
+trigger:
+  schedule:
+    cron: "0 */1 * * *" # Run every hour
+
+variables:
+  - name: storage_preference
+    value: "GCP" # Can be changed to POSTGRES

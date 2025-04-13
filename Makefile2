@@ -1,0 +1,47 @@
+.PHONY: up down start-infra start-apps logs clean
+
+# Start everything in the correct order with proper delays
+up:
+	@echo "Starting ZooKeeper and Kafka..."
+	docker-compose up -d zookeeper kafka
+	@echo "Waiting for Kafka to initialize (15 seconds)..."
+	@sleep 15
+	@echo "Starting data generator..."
+	docker-compose up -d data-generator
+	@echo "Waiting for data generation (5 seconds)..."
+	@sleep 5
+	@echo "Starting vote simulator..."
+	docker-compose up -d vote-simulator
+	@echo "All services started successfully!"
+	@echo "Run 'make logs' to see the logs"
+
+# Start only infrastructure components
+start-infra:
+	@echo "Starting ZooKeeper and Kafka..."
+	docker-compose up -d zookeeper kafka
+	@echo "Waiting for Kafka to initialize (15 seconds)..."
+	@sleep 15
+	@echo "Infrastructure is ready!"
+
+# Start only application components
+start-apps:
+	@echo "Starting data generator..."
+	docker-compose up -d data-generator
+	@echo "Waiting for data generation (5 seconds)..."
+	@sleep 5
+	@echo "Starting vote simulator..."
+	docker-compose up -d vote-simulator
+	@echo "Applications started successfully!"
+
+# Show logs for all services
+logs:
+	docker-compose logs -f
+
+# Stop and remove all containers
+down:
+	docker-compose down
+
+# Remove volumes and any created data
+clean:
+	docker-compose down -v
+	@echo "Cleaned up all containers and volumes"
